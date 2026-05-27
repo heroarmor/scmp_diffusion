@@ -56,7 +56,7 @@ atexit.register(_summary)
 # Replay the same all-ops uniform-L=128 run we did earlier
 sys.argv = [
     'quant_sc_main.py',
-    '--ckpt', '/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_llm/pretrained_models/DiT-XL-2-256x256.pt',
+    '--ckpt', os.environ.get('DIT_CKPT', 'pretrained_models/DiT-XL-2-256x256.pt'),
     '--wbits', '8', '--abits', '8', '--w_sym', '--a_sym',
     '--timewise', '1.0',
     '--qklayerwise', '1.0', '--avlayerwise', '1.0',
