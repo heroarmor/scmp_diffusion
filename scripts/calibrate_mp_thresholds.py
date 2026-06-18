@@ -521,13 +521,10 @@ def _run_mlp_linear_level(
             x_chunk = x_flat[:, start:end].contiguous()
             w_chunk = weight[:, start:end].contiguous()
             config = module._get_sc_config(end - start, sc_prec)
-            chunk_result = sc_matmul_enable_triton_mlp(
+            chunk_result = sc_matmul(
                 x_chunk,
                 w_chunk,
-                x_chunk.max().item(),
-                x_chunk.min().item(),
-                w_chunk.max().item(),
-                w_chunk.min().item(),
+                granularity="per_row",
                 mode=module.sc_mode,
                 sc_prec=sc_prec,
                 config=config,
