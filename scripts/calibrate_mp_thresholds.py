@@ -248,6 +248,56 @@ def _thresholds_from_counts(metrics: np.ndarray, counts: np.ndarray) -> list[flo
     return thresholds
 
 
+def _global_lambda(
+    weighted_errors: list[np.ndarray],
+    costs: np.ndarray,
+    budget_ratio: float,
+    ref: float,
+    row_counts: list[float],
+) -> float:
+    """One shared Lagrange multiplier lambda across ALL groups for a GLOBAL,
+    row-weighted budget -- the cross-layer allocation core (ported from
+    CrucibleComputingGroup/scmp_llm PR #9). Budget flows across layers/operators
+    instead of pinning each (op, t-bucket, l-bucket) to budget_ratio*ref.
+
+    row_counts[g] = group g's TRUE (un-subsampled) per-forward row count R_g.
+    rep_g = R_g/n_g prices each stored (subsampled) row as R_g/n_g real rows, so
+    the per-row assignment and the R_g-weighted budget share one consistent
+    objective -> uniform is feasible and the optimum is <= uniform. Without R_g
+    weighting, attention (qk/av), with far more rows per forward than the linears,
+    is under-counted and global overspends (realized avg_sl >> target)."""
+    total_rows = float(sum(row_counts))
+    if total_rows <= 0:
+        return 0.0
+    reps = [float(R) / max(int(e.shape[0]), 1)
+            for e, R in zip(weighted_errors, row_counts)]
+    global_budget = budget_ratio * ref * total_rows
+    min_cost = float(total_rows * costs[-1])
+    max_cost = float(total_rows * costs[0])
+    if global_budget >= max_cost:
+        return 0.0
+    if global_budget <= min_cost:
+        return 1e12
+
+    def total_cost(lmbd: float) -> float:
+        t = 0.0
+        for e, R, rep in zip(weighted_errors, row_counts, reps):
+            assign = (e + lmbd * rep * costs[None, :]).argmin(axis=1)
+            t += float(R) * float(costs[assign].mean())
+        return t
+
+    lo, hi = 0.0, 1.0
+    while total_cost(hi) > global_budget and hi < 1e12:
+        hi *= 2.0
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        if total_cost(mid) > global_budget:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
 class ThresholdCalibrator:
     def __init__(
         self,
@@ -263,6 +313,8 @@ class ThresholdCalibrator:
         max_units_per_call: int,
         min_bucket_units: int,
         rng_seed: int,
+        log_raw: bool = False,
+        budget_scope: str = "per_bucket",
     ):
         self.levels = levels
         self.operators = set(operators)
@@ -279,7 +331,17 @@ class ThresholdCalibrator:
         self.records: dict[tuple[str, int, int], dict[str, list[np.ndarray]]] = defaultdict(
             lambda: {"metrics": [], "errors": []}
         )
+        # Budget scope: "per_bucket" (each (op,t,l) pinned to budget_ratio*ref --
+        # original) or "global" (one shared lambda over all groups; budget flows
+        # across layers/operators -- PR#9 port). true_counts accumulates each
+        # group's pre-subsample row count R_g, used for the R_g-weighted global lambda.
+        self.budget_scope = budget_scope
+        self.true_counts: dict[tuple[str, int, int], int] = defaultdict(int)
         self._rng = np.random.default_rng(rng_seed)
+        # Optional full-resolution log keyed by raw (operator, block_idx, timestep) so the
+        # bucketing can be re-derived offline (any timestep/layer_buckets) without re-probing.
+        self.log_raw = log_raw
+        self.raw_log: list[tuple[str, int, int, np.ndarray, np.ndarray]] = []
 
     def _use_operator(self, operator: str) -> bool:
         return operator in self.operators
@@ -314,20 +376,68 @@ class ThresholdCalibrator:
         if metrics.size == 0:
             return
 
+        true_n = int(metrics.size)  # TRUE per-call row count (before subsampling)
         if self.max_units_per_call > 0 and metrics.size > self.max_units_per_call:
             keep = self._rng.choice(metrics.size, self.max_units_per_call, replace=False)
             metrics = metrics[keep]
             errors = errors[keep]
+
+        if self.log_raw:
+            self.raw_log.append((operator, int(block_idx), int(timestep), metrics, errors))
 
         t_bucket = _bucket_index(timestep, self.total_timesteps, self.timestep_buckets)
         l_bucket = _bucket_index(block_idx, self.total_blocks, self.layer_buckets)
         key = (operator, t_bucket, l_bucket)
         self.records[key]["metrics"].append(metrics)
         self.records[key]["errors"].append(errors)
+        self.true_counts[key] += true_n
 
-    def _fit_group(self, metrics: np.ndarray, errors: np.ndarray) -> dict:
-        budget_total = self.budget_ratio * self.budget_ref_stoc_len * metrics.size
-        assignment = _cost_assignments(errors, self.costs, budget_total)
+    def dump_raw(self, path: str):
+        """Pickle the full-resolution per-(operator,block,timestep) records plus the
+        metadata needed to re-fit any bucketing offline (see rebucket_from_raw.py)."""
+        import pickle
+        meta = {
+            "levels": self.levels,
+            "operators": sorted(self.operators),
+            "total_timesteps": self.total_timesteps,
+            "total_blocks": self.total_blocks,
+            "budget_ratio": self.budget_ratio,
+            "budget_ref_stoc_len": self.budget_ref_stoc_len,
+            "min_bucket_units": self.min_bucket_units,
+        }
+        with open(path, "wb") as f:
+            pickle.dump({"meta": meta, "raw_log": self.raw_log}, f, protocol=4)
+        print(f"Wrote raw calibration log ({len(self.raw_log)} records) to {path}")
+
+    def _rep_for_key(self, key) -> float:
+        """rep_g = R_g / n_g for one group (cost scale for the global assignment)."""
+        n = sum(int(m.size) for m in self.records[key]["metrics"])
+        R = float(self.true_counts.get(key, n))
+        return R / max(n, 1)
+
+    def _rep_for_op(self, operator) -> float:
+        n = R = 0
+        for key, rec in self.records.items():
+            if key[0] != operator:
+                continue
+            ng = sum(int(m.size) for m in rec["metrics"])
+            n += ng
+            R += self.true_counts.get(key, ng)
+        return (R / max(n, 1)) if n else 1.0
+
+    def _fit_group(self, metrics: np.ndarray, errors: np.ndarray,
+                   lam: float | None = None, weight: float = 1.0,
+                   rep: float = 1.0) -> dict:
+        if lam is None:
+            # Per-bucket budget: pin this group to budget_ratio*ref average.
+            budget_total = self.budget_ratio * self.budget_ref_stoc_len * metrics.size
+            assignment = _cost_assignments(errors, self.costs, budget_total)
+        else:
+            # Global cross-layer: assign at the shared price lambda, cost scaled by
+            # rep_g = R_g/n_g so cheap (few-row) groups buy precision cheaply,
+            # consistent with the R_g-weighted budget (see _global_lambda).
+            objective = (weight * errors) + lam * rep * self.costs[None, :]
+            assignment = objective.argmin(axis=1)
         counts = np.bincount(assignment, minlength=len(self.levels))
         thresholds = _thresholds_from_counts(metrics, counts)
         avg_cost = float(self.costs[assignment].mean()) if assignment.size else 0.0
@@ -354,9 +464,26 @@ class ThresholdCalibrator:
             "budget_ref_stoc_len": self.budget_ref_stoc_len,
             "timestep_buckets": self.timestep_buckets,
             "layer_buckets": self.layer_buckets,
+            "budget_scope": self.budget_scope,
             "operator_defaults": {},
             "buckets": {},
         }
+
+        # Global cross-layer: ONE shared lambda over all per-bucket groups so the
+        # budget flows across layers/operators (uniform importance W_g=1; this is
+        # PR#9's `act_global` signal). per_bucket leaves lam=None (each group
+        # independently pinned to budget_ratio*ref -- original behaviour).
+        global_lam = None
+        if self.budget_scope == "global":
+            werrs, row_counts = [], []
+            for key, rec in self.records.items():
+                e = np.concatenate(rec["errors"], axis=0)
+                werrs.append(e)
+                row_counts.append(float(self.true_counts.get(key, e.shape[0])))
+            global_lam = _global_lambda(
+                werrs, self.costs, self.budget_ratio,
+                float(self.budget_ref_stoc_len), row_counts)
+            payload["global_lambda"] = float(global_lam)
 
         for operator in sorted(self.operators):
             op_metrics = []
@@ -370,6 +497,7 @@ class ThresholdCalibrator:
                 fitted = self._fit_group(
                     np.concatenate(op_metrics, axis=0),
                     np.concatenate(op_errors, axis=0),
+                    lam=global_lam, weight=1.0, rep=self._rep_for_op(operator),
                 )
                 payload["operator_defaults"][operator] = fitted
                 summary_rows.append(
@@ -390,7 +518,8 @@ class ThresholdCalibrator:
             if metrics.size < self.min_bucket_units:
                 continue
             operator, t_bucket, l_bucket = key
-            fitted = self._fit_group(metrics, errors)
+            fitted = self._fit_group(metrics, errors, lam=global_lam,
+                                     weight=1.0, rep=self._rep_for_key(key))
             bucket_key = f"{operator}:t{t_bucket}:l{l_bucket}"
             payload["buckets"][bucket_key] = fitted
             summary_rows.append(
@@ -402,6 +531,18 @@ class ThresholdCalibrator:
                     **_flatten_summary(fitted),
                 }
             )
+
+        # Honest iso-budget check: row-weighted (R_g) average stoc_len across all
+        # buckets. For per_bucket this is ~budget_ratio*ref by construction; for
+        # global it's the realized average -- should also land near the target.
+        num = den = 0.0
+        for bkey, fitted in payload["buckets"].items():
+            op, tpart, lpart = bkey.split(":")
+            k = (op, int(tpart[1:]), int(lpart[1:]))
+            R = float(self.true_counts.get(k, fitted["num_units"]))
+            num += R * fitted["avg_stoc_len"]
+            den += R
+        payload["expected_avg_stoc_len"] = (num / den) if den else 0.0
 
         return payload, summary_rows
 
@@ -825,6 +966,23 @@ def _build_parser():
         help="Optional comma-separated timestep list. Default: evenly spaced samples.",
     )
     parser.add_argument(
+        "--dump_raw",
+        type=str,
+        default=None,
+        help="If set, pickle the full-resolution per-(operator,block,timestep) error log "
+             "to this path so any bucketing can be re-derived offline (rebucket_from_raw.py).",
+    )
+    parser.add_argument(
+        "--budget_scope",
+        type=str,
+        choices=["per_bucket", "global"],
+        default="per_bucket",
+        help="Budget allocation scope. 'per_bucket' (default, original): each "
+             "(op,t-bucket,l-bucket) pinned to budget_ratio*ref average. 'global' "
+             "(PR#9 port): one shared lambda over all groups so budget flows across "
+             "layers/operators (R_g-weighted -> optimum provably <= uniform).",
+    )
+    parser.add_argument(
         "--num_calib_timesteps",
         type=int,
         default=6,
@@ -865,8 +1023,12 @@ def _build_parser():
     parser.add_argument(
         "--max_units_per_call",
         type=int,
-        default=512,
-        help="Randomly subsample units per operator call to bound runtime and memory.",
+        default=0,
+        help="Randomly subsample units per operator call to bound runtime/memory. "
+             "0 (default) = NO subsampling -> every operator recorded full per-row, so "
+             "stored n_g == true rows R_g and rep_g==1 uniformly. This removes the "
+             "subsampling asymmetry (av uncapped vs linears capped) that distorted the "
+             "global row-weighted allocation.",
     )
     parser.add_argument(
         "--min_bucket_units",
@@ -983,6 +1145,8 @@ def main():
         max_units_per_call=args.max_units_per_call,
         min_bucket_units=args.min_bucket_units,
         rng_seed=args.seed,
+        log_raw=bool(args.dump_raw),
+        budget_scope=args.budget_scope,
     )
     runner = CalibrationRunner(args, model, diffusion, sc_controller, calibrator)
     hooks = runner.register_hooks()
@@ -1028,6 +1192,10 @@ def main():
     payload, summary_rows = calibrator.export()
     payload["selected_timesteps"] = selected_timesteps
     payload["operators"] = sorted(operators)
+    print(f"[calib] budget_scope={payload['budget_scope']} "
+          f"global_lambda={payload.get('global_lambda', 'n/a')} "
+          f"expected_avg_stoc_len={payload.get('expected_avg_stoc_len', 0):.2f} "
+          f"(target={budget_ratio * budget_ref_stoc_len:.1f})")
 
     output_json_path = Path(args.calib_output_json)
     output_json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1040,6 +1208,10 @@ def main():
 
     print(f"Wrote calibration JSON to {output_json_path}")
     print(f"Wrote summary CSV to {summary_csv_path}")
+
+    if args.dump_raw:
+        Path(args.dump_raw).parent.mkdir(parents=True, exist_ok=True)
+        calibrator.dump_raw(args.dump_raw)
 
 
 if __name__ == "__main__":

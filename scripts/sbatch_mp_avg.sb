@@ -1,0 +1,73 @@
+#!/bin/bash
+#SBATCH --job-name=mp_avg
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-gpu=2
+#SBATCH --mem-per-gpu=12G
+#SBATCH --time=1-12:00:00
+#
+# Adaptive-MP (calibrated) FID-10k generation for ONE target avg_stoc_len, on a
+# self-contained 2-GPU SLURM job. Usage:
+#   sbatch -J mp_avg64 -o <out> -e <err> scripts/sbatch_mp_avg.sb 64
+# Resumable: re-sbatch the same; the planner skips on-disk indices.
+set -uo pipefail
+AVG="${1:?usage: sbatch ... sbatch_mp_avg.sb <AVG: 64|96|128>}"
+
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$SCRATCH/pretrained_models/DiT-XL-2-256x256.pt
+CALIB=$SCRATCH/scmp_diffusion_fid_mp_cfg15/calib/calib_fix_avg${AVG}_l256_ref192.json
+OUT=$SCRATCH/scmp_diffusion_fid_mp_cfg15/adaptive_avg${AVG}
+SAMPLES=$OUT/samples; IDX=$OUT/_indices; LOG=$OUT/_logs
+NUM_FID=10000; BATCH=64; STEPS=50; CFG=1.5; SEED=0; NUM_CLASSES=1000
+MP_LEVELS=256,192,128,96,64,48,32,16
+mkdir -p "$SAMPLES" "$IDX" "$LOG"
+
+[[ -f "$CALIB" ]] || { echo "ERROR: missing calib table $CALIB" >&2; exit 1; }
+
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh
+conda activate qdit
+export SC_OWEN_MODE=bitrev PYTHONUNBUFFERED=1 OMP_NUM_THREADS=${SLURM_CPUS_PER_GPU:-8}
+cd "$REPO"
+
+echo "=== mp_avg${AVG} job=${SLURM_JOB_ID:-?} host=$(hostname -s) start $(date) ==="
+echo "    CALIB=$CALIB"
+
+# 2-way work-steal split (align=samples/class so chunks stay class-balanced)
+python -u scripts/_plan_missing_indices.py "$SAMPLES" "$NUM_FID" 2 "$IDX" $((NUM_FID/NUM_CLASSES))
+
+pids=()
+for g in 0 1; do
+    IDXF="$IDX/gpu_${g}.txt"
+    [[ -s "$IDXF" ]] || { echo "[gpu$g] no work"; continue; }
+    CUDA_VISIBLE_DEVICES=$g python -u scripts/quant_sc_main.py \
+        --wbits 8 --abits 8 --w_sym --a_sym \
+        --timewise 1 --qklayerwise 1.0 --avlayerwise 1.0 \
+        --projlayerwise 1.0 --mlplayerwise 1.0 --inputprojlayerwise 1.0 \
+        --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row \
+        --adaptive_mp --adaptive_mp_table "$CALIB" --mp_levels "$MP_LEVELS" \
+        --image-size 256 --num-sampling-steps "$STEPS" --cfg-scale "$CFG" \
+        --batch-size "$BATCH" \
+        --generate-fid-samples --balanced_classes \
+        --num-classes "$NUM_CLASSES" --balanced_total_samples "$NUM_FID" \
+        --num-fid-samples "$NUM_FID" \
+        --target_indices_path "$IDXF" --samples_dir_override "$SAMPLES" \
+        --seed "$SEED" --results-dir "$LOG/gpu_${g}" --ckpt "$CKPT" \
+        > "$LOG/gpu_${g}.log" 2>&1 &
+    pids+=($!)
+done
+rc=0
+for p in "${pids[@]}"; do wait "$p" || rc=1; done
+
+FINAL=$(find "$SAMPLES" -maxdepth 1 -name '[0-9][0-9][0-9][0-9][0-9][0-9].png' | wc -l)
+echo "=== generated $FINAL/$NUM_FID (rc=$rc) at $(date) ==="
+if [[ "$FINAL" -lt "$NUM_FID" ]]; then echo "[partial] re-sbatch to resume"; exit 1; fi
+
+echo "=== eval avg${AVG} ==="
+bash scripts/eval_openai.sh "$SAMPLES" "$OUT/adaptive_avg${AVG}" || echo "[warn] eval_openai failed (samples saved; rerun later)"
+bash scripts/eval/kid_openai.sh "$OUT/adaptive_avg${AVG}.kid.txt" "$OUT/adaptive_avg${AVG}.npz" || echo "[warn] kid failed (rerun later)"
+echo "=== RESULTS avg${AVG} ==="
+grep -E "^(Inception Score|FID|sFID|Precision|Recall):" "$OUT/adaptive_avg${AVG}.openai_eval.txt" 2>/dev/null
+cat "$OUT/adaptive_avg${AVG}.kid.txt" 2>/dev/null
+echo "DONE avg${AVG} $(date)"

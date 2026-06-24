@@ -22,7 +22,7 @@ for e in "${T[@]}"; do
         --mp_levels 256,192,128,96,64,48,32,16 \
         --budget_ratio "$BR" --budget_ref_stoc_len 256 \
         --metric cosine --teacher fp \
-        --sc_prec 8 --sc_fixed_level_prec \
+        --sc_prec 8 --sc_fixed_level_prec --sc_qk_granularity per_row \
         --wbits 8 --abits 8 --w_sym --a_sym \
         --image-size 256 --num-sampling-steps 50 \
         --num_calib_batches 1 --num_calib_timesteps 6 \
