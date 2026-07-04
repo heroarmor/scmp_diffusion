@@ -866,11 +866,11 @@ def create_argparser():
 
     # Quantization parameters (same as quant_main.py)
     parser.add_argument(
-        '--wbits', type=int, default=8, choices=[2, 3, 4, 5, 6, 8, 16],
+        '--wbits', type=int, default=8, choices=[2, 3, 4, 5, 6, 7, 8, 16],
         help='Bits for weight quantization (16 for no quantization).'
     )
     parser.add_argument(
-        '--abits', type=int, default=8, choices=[2, 3, 4, 5, 6, 8, 16],
+        '--abits', type=int, default=8, choices=[2, 3, 4, 5, 6, 7, 8, 16],
         help='Bits for activation quantization (16 for no quantization).'
     )
     parser.add_argument(

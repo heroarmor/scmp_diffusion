@@ -1,0 +1,58 @@
+#!/bin/bash
+#SBATCH --job-name=bl_auto
+#SBATCH --partition=gpu-rtx6000
+#SBATCH --account=nbleier_owned1
+#SBATCH --gres=gpu:3
+#SBATCH --cpus-per-gpu=2
+#SBATCH --mem-per-gpu=12G
+#SBATCH --time=08:00:00
+#
+# PURE-QUANT baseline generation (NO SC at all — timewise/layerwise unset → SC never applied).
+# Weights/activations quantized to WBITS/ABITS. symmetric if SYM=sym (--w_sym --a_sym), else asymmetric.
+# 2000 imgs, first 200 classes x10 (idx 0-1999), cfg=1.5, seed 0 — same layout as the SC sweeps.
+# TIMEOUT-safe auto-resume. Usage: sbatch sbatch_baseline_auto.sb <WBITS> <ABITS> <sym|asym> [CHAIN]
+set -uo pipefail
+WBITS="${1:?usage: sbatch sbatch_baseline_auto.sb <WBITS> <ABITS> <sym|asym> [CHAIN]}"
+ABITS="${2:?ABITS}"; SYM="${3:?sym|asym}"; CHAIN="${4:-0}"
+NUM_GPUS=3; MAXCHAIN=15
+SELF=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion/scripts/sbatch_baseline_auto.sb
+REPO=/gpfs/accounts/nbleier_owned_root/nbleier_owned1/zhkangqi/scmp_diffusion
+SCRATCH=/scratch/nbleier_owned_root/nbleier_owned1/zhkangqi
+CKPT=$SCRATCH/pretrained_models/DiT-XL-2-256x256.pt
+OUT=$SCRATCH/scmp_diffusion_fid_baseline_cfg15/w${WBITS}a${ABITS}_${SYM}
+SAMPLES=$OUT/samples; IDX=$OUT/_indices; LOG=$OUT/_logs
+NUM_FID=2000; BALANCED=10000; BATCH=64; STEPS=50; CFG=1.5; SEED=0; NUM_CLASSES=1000
+case "$SYM" in
+    sym)  SYMFLAG="--w_sym --a_sym" ;;
+    asym) SYMFLAG="" ;;
+    *) echo "ERROR: SYM must be sym|asym, got $SYM" >&2; exit 1 ;;
+esac
+mkdir -p "$SAMPLES" "$IDX" "$LOG"
+source /home/zhkangqi/miniconda3/etc/profile.d/conda.sh; conda activate qdit
+export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2; cd "$REPO"
+cnt(){ find "$SAMPLES" -maxdepth 1 -name '[0-9][0-9][0-9][0-9][0-9][0-9].png' | wc -l; }
+START=$(cnt)
+echo "=== baseline w${WBITS}a${ABITS}_${SYM} (SYMFLAG='${SYMFLAG:-<asym>}'): start=$START/$NUM_FID chain=$CHAIN job=${SLURM_JOB_ID:-?} $(date) ==="
+if [[ "$START" -ge "$NUM_FID" ]]; then echo "[complete] already at $NUM_FID"; exit 0; fi
+# queue successor NOW (afterany), chain-capped
+if [[ "$CHAIN" -lt "$MAXCHAIN" ]]; then
+    sbatch -o "$OUT/slurm-%j.out" -e "$OUT/slurm-%j.err" \
+        --dependency=afterany:${SLURM_JOB_ID} "$SELF" "$WBITS" "$ABITS" "$SYM" $((CHAIN+1)) \
+        && echo "[chain] queued successor (chain=$((CHAIN+1)))"
+fi
+python -u scripts/_plan_missing_indices.py "$SAMPLES" "$NUM_FID" "$NUM_GPUS" "$IDX" $((BALANCED/NUM_CLASSES))
+pids=()
+for ((g=0; g<NUM_GPUS; g++)); do
+    IDXF="$IDX/gpu_${g}.txt"; [[ -s "$IDXF" ]] || { echo "[gpu$g] no work"; continue; }
+    CUDA_VISIBLE_DEVICES=$g python -u scripts/quant_sc_main.py \
+        --wbits "$WBITS" --abits "$ABITS" $SYMFLAG \
+        --image-size 256 --num-sampling-steps "$STEPS" --cfg-scale "$CFG" --batch-size "$BATCH" \
+        --generate-fid-samples --balanced_classes --num-classes "$NUM_CLASSES" \
+        --balanced_total_samples "$BALANCED" --num-fid-samples "$BALANCED" \
+        --target_indices_path "$IDXF" --samples_dir_override "$SAMPLES" \
+        --seed "$SEED" --results-dir "$LOG/gpu_${g}" --ckpt "$CKPT" \
+        > "$LOG/gpu_${g}.log" 2>&1 &
+    pids+=($!)
+done
+for p in "${pids[@]}"; do wait "$p" || true; done
+echo "=== baseline w${WBITS}a${ABITS}_${SYM}: $START -> $(cnt)/$NUM_FID $(date) ==="
