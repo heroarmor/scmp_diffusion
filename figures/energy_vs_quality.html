@@ -99,14 +99,14 @@
     <tbody id="tbody"></tbody>
   </table>
 
-  <p class="foot"><b>Read:</b> at the <b>same energy (E=0.75, L96)</b>, adaptive beats uniform on <span class="win">both</span> axes — KID 3.12 vs 3.41 and PSNR 25.0 vs 23.1 — a Pareto win, not a fidelity trade. Uniform collapses at <b>E=0.25 (L32)</b> (KID 8.48, off-scale). SC configs left of E=1.0 are <b>cheaper than a plain int8 MAC</b> under this model, and the good ones also beat the W8A8 no-SC floor.
-  <br><br><span style="color:var(--muted)">Preliminary: adaptive avg48 KID and avg64/avg32 are still evaluating/generating; PSNR is on seed-matched (MAE&lt;35) subsets. Energy uses the given E_sc=2·E_int@int8 model, linear in cycles.</span></p>
+  <p class="foot"><b>Read:</b> the adaptive advantage <b>scales with budget</b>. At <b>E=0.75 (L96)</b> adaptive beats uniform on <span class="win">both</span> axes (KID 3.12 vs 3.41, PSNR 25.0 vs 23.1) — a Pareto win. But at <b>E=0.375 (L48)</b> adaptive is only tied on FID/PSNR and <b>worse on KID (4.21 vs 2.95)</b>: uniform-48 is the KID sweet spot, and at a tiny budget there's little to reallocate. Uniform collapses at <b>E=0.25 (L32)</b> (KID 8.48, off-scale).
+  <br><br><span style="color:var(--muted)">Preliminary: adaptive avg64/avg32 still generating; PSNR is on seed-matched (MAE&lt;35) subsets. Energy uses the given E_sc=2·E_int@int8 model, linear in cycles.</span></p>
 </div>
 
 <script>
 const uni=[{L:32,e:.25,kid:8.48,psnr:20.49},{L:48,e:.375,kid:2.95,psnr:22.79},
   {L:64,e:.5,kid:3.05,psnr:23.22},{L:96,e:.75,kid:3.41,psnr:23.08},{L:128,e:1,kid:3.31,psnr:23.39}];
-const ada=[{L:48,e:.375,kid:null,psnr:22.71},{L:96,e:.75,kid:3.12,psnr:25.02}];
+const ada=[{L:48,e:.375,kid:4.21,psnr:22.71},{L:96,e:.75,kid:3.12,psnr:25.02}];
 const refW={e:1,kid:3.36,psnr:23.19}, refFPkid=3.56;
 
 const ML=52,MR=16,MT=18,MB=44,W=460,H=330,PW=W-ML-MR,PH=H-MT-MB;
@@ -164,7 +164,7 @@ function panel(id,key,ymin,ymax,yt,ytf){
 function mark(x,y,r){return `M${x} ${y-r} L${x+r} ${y} L${x} ${y+r} L${x-r} ${y} Z`;}
 function addTip(node,txt){const t=el("title",{});t.textContent=txt;node.appendChild(t);node.setAttribute("tabindex","0");}
 
-panel("kid","kid",2.8,3.72,[2.8,3.0,3.2,3.4,3.6],v=>v.toFixed(1));
+panel("kid","kid",2.8,4.45,[2.8,3.2,3.6,4.0,4.4],v=>v.toFixed(1));
 panel("psnr","psnr",20,26,[20,21,22,23,24,25,26],v=>v.toFixed(0));
 
 // table
